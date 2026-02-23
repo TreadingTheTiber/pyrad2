@@ -17,6 +17,18 @@ class PacketType(IntEnum):
     CoARequest = 43
     CoAACK = 44
     CoANAK = 45
+    ProtocolError = 52  # RFC 7930 §4
+
+
+# RADIUS/1.1 protocol version constants (RFC 9765)
+RADIUS_ALPN_RADIUS_10 = "radius/1.0"
+RADIUS_ALPN_RADIUS_11 = "radius/1.1"
+
+# Message-Authenticator attribute code
+ATTR_MESSAGE_AUTHENTICATOR = 80
+
+# Error-Cause attribute code (RFC 5765)
+ATTR_ERROR_CAUSE = 101
 
 
 class EAPPacketType(IntEnum):

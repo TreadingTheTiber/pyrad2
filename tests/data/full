@@ -19,6 +19,7 @@ ATTRIBUTE  Message-Authenticator 80  octets
 ATTRIBUTE Test-Encrypted-String   5   string      encrypt=2
 ATTRIBUTE Test-Encrypted-Octets   6   octets      encrypt=2
 ATTRIBUTE Test-Encrypted-Integer  7   integer     encrypt=2
+ATTRIBUTE Tunnel-Password         69  string      encrypt=2
 
 VENDOR Simplon 16
 
