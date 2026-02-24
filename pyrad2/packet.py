@@ -46,6 +46,8 @@ class Packet(OrderedDict):
         id: Optional[int] = None,
         secret: bytes = b"radsec",
         authenticator: Optional[bytes] = None,
+        protocol_version: Optional[str] = None,
+        token: Optional[bytes] = None,
         **attributes,
     ):
         """Initializes a Packet instance.
@@ -55,12 +57,18 @@ class Packet(OrderedDict):
             id (int): Packet identification number (8 bits).
             secret (str): Secret needed to communicate with a RADIUS server.
             authenticator (bytes): Optional authenticator
+            protocol_version (str): Optional protocol version ("1.1" for RFC 9765)
+            token (bytes): Optional 4-byte token for RADIUS/1.1 request/response matching
             attributes (dict): Attributes to set in the packet
         """
         super().__init__()
+        self.protocol_version = attributes.pop("protocol_version", protocol_version)
+        self.token = token
         self.code = code
         if id is not None:
             self.id = id
+        elif self.protocol_version == "1.1":
+            self.id = 0
         else:
             self.id = CreateID()
         if not isinstance(secret, bytes):
@@ -91,12 +99,15 @@ class Packet(OrderedDict):
                 "fd",
                 "packet",
                 "message_authenticator",
+                "protocol_version",
             ]:
                 continue
             key = key.replace("_", "-")
             self.AddAttribute(key, value)
 
     def add_message_authenticator(self) -> None:
+        if self.protocol_version == "1.1":
+            return
         self.message_authenticator = True
         # Maintain a zero octets content for md5 and hmac calculation.
         self["Message-Authenticator"] = 16 * b"\00"
@@ -113,6 +124,8 @@ class Packet(OrderedDict):
         return self.message_authenticator
 
     def _refresh_message_authenticator(self):
+        if self.protocol_version == "1.1":
+            return
         hmac_constructor = hmac_new(self.secret)
 
         # Maintain a zero octets content for md5 and hmac calculation.
@@ -158,6 +171,8 @@ class Packet(OrderedDict):
         Returns:
             bool: False if verification failed else True
         """
+        if self.protocol_version == "1.1":
+            return True
         if self.message_authenticator is None:
             raise Exception("No Message-Authenticator AVP present")
 
@@ -232,11 +247,13 @@ class Packet(OrderedDict):
             secret=self.secret,
             authenticator=self.authenticator,
             dict=self.dict,
+            protocol_version=self.protocol_version,
+            token=self.token,
             **attributes,
         )
 
     def _DecodeValue(self, attr: Attribute, value: bytes) -> bytes | str:
-        if attr.encrypt == 2:
+        if attr.encrypt == 2 and self.protocol_version != "1.1":
             # salt decrypt attribute
             value = self.SaltDecrypt(value)
 
@@ -251,7 +268,7 @@ class Packet(OrderedDict):
         else:
             result = tools.EncodeAttr(attr.type, value)
 
-        if attr.encrypt == 2:
+        if attr.encrypt == 2 and self.protocol_version != "1.1":
             # salt encrypt attribute
             result = self.SaltCrypt(result)
 
@@ -399,6 +416,15 @@ class Packet(OrderedDict):
         Returns:
             bytes: Raw packet
         """
+        if self.protocol_version == "1.1":
+            attr = self._PktEncodeAttributes()
+            header = struct.pack("!BBH", self.code, self.id, (20 + len(attr)))
+            if self.token is not None:
+                authenticator = self.token + 12 * b"\x00"
+            else:
+                authenticator = self.authenticator
+            return header + authenticator + attr
+
         assert self.authenticator
 
         assert self.secret is not None
@@ -416,6 +442,9 @@ class Packet(OrderedDict):
         return header + authenticator + attr
 
     def VerifyReply(self, reply: "Packet", rawreply: Optional[bytes] = None) -> bool:
+        if self.protocol_version == "1.1":
+            return self.token is not None and self.token == reply.token
+
         if reply.id != self.id:
             return False
 
@@ -551,6 +580,9 @@ class Packet(OrderedDict):
         if length > 8192:
             raise PacketError("Packet length is too long (%d)" % length)
 
+        if self.protocol_version == "1.1":
+            self.token = self.authenticator[0:4]
+
         self.clear()
 
         packet = packet[20:]
@@ -569,9 +601,14 @@ class Packet(OrderedDict):
                 for key, value in self._PktDecodeVendorAttribute(value):
                     self.setdefault(key, []).append(value)
             elif key == 80:
-                # POST: Message Authenticator AVP is present.
-                self.message_authenticator = True
-                self.setdefault(key, []).append(value)
+                if self.protocol_version == "1.1":
+                    # In RADIUS/1.1 mode, Message-Authenticator is prohibited;
+                    # silently discard it.
+                    pass
+                else:
+                    # POST: Message Authenticator AVP is present.
+                    self.message_authenticator = True
+                    self.setdefault(key, []).append(value)
             elif attribute and attribute.type == "tlv":
                 self._PktDecodeTlvAttribute(key, value)
             else:
@@ -604,6 +641,14 @@ class Packet(OrderedDict):
         if isinstance(value, str):
             value = value.encode("utf-8")
 
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, no salt encryption (TLS protects the data).
+            # Return with salt (2 bytes) + length prefix + value (no encryption).
+            random_value = 32768 + random_generator.randrange(0, 32767)
+            salt_raw = struct.pack("!H", random_value)
+            length = struct.pack("B", len(value))
+            return salt_raw + length + value
+
         if self.authenticator is None:
             # self.authenticator = self.CreateAuthenticator()
             self.authenticator = 16 * b"\x00"
@@ -631,6 +676,13 @@ class Packet(OrderedDict):
         Returns:
             bytes: Decrypted plaintext string
         """
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, no salt encryption (TLS protects the data).
+            # Strip salt (2 bytes) and length prefix, return plaintext.
+            value = value[2:]  # strip salt
+            length = value[0]
+            return value[1 : length + 1]
+
         # extract salt
         salt = value[:2]
 
@@ -691,6 +743,8 @@ class AuthPacket(Packet):
             self.authenticator,
             dict=self.dict,
             auth_type=self.auth_type,
+            protocol_version=self.protocol_version,
+            token=self.token,
             **attributes,
         )
 
@@ -702,6 +756,19 @@ class AuthPacket(Packet):
         Returns:
             bytes: Raw packet
         """
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, build authenticator from token + zeros.
+            if self.token is not None:
+                self.authenticator = self.token + 12 * b"\x00"
+            elif self.authenticator is None:
+                self.authenticator = self.CreateAuthenticator()
+
+            attr = self._PktEncodeAttributes()
+            header = struct.pack(
+                "!BBH16s", self.code, self.id, (20 + len(attr)), self.authenticator
+            )
+            return header + attr
+
         if self.authenticator is None:
             self.authenticator = self.CreateAuthenticator()
 
@@ -748,6 +815,17 @@ class AuthPacket(Packet):
         Returns:
             str: Plaintext passsword
         """
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, password is sent in plaintext (TLS protects).
+            # Just strip null padding and decode.
+            if isinstance(password, bytes):
+                pw = password
+            else:
+                pw = password.encode("utf-8")
+            while pw.endswith(b"\x00"):
+                pw = pw[:-1]
+            return pw.decode("utf-8", errors="ignore")
+
         buf = password
         pw = b""
 
@@ -784,11 +862,19 @@ class AuthPacket(Packet):
         Returns:
             bytes: Obfuscated version of the password
         """
-        if self.authenticator is None:
-            self.authenticator = self.CreateAuthenticator()
-
         if isinstance(password, str):
             password = password.encode("utf-8")
+
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, password is sent in plaintext (TLS protects).
+            # Pad to 16-byte boundary for format compatibility.
+            buf = password
+            if len(password) % 16 != 0:
+                buf += b"\x00" * (16 - (len(password) % 16))
+            return buf
+
+        if self.authenticator is None:
+            self.authenticator = self.CreateAuthenticator()
 
         buf = password
         if len(password) % 16 != 0:
@@ -829,9 +915,18 @@ class AuthPacket(Packet):
         chapid = chap_password[:1]
         password = chap_password[1:]
 
-        challenge = self.authenticator
-        if "CHAP-Challenge" in self:
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, CHAP-Challenge attribute is REQUIRED.
+            # Cannot use authenticator as implicit challenge.
+            if "CHAP-Challenge" not in self:
+                raise PacketError(
+                    "RADIUS/1.1 requires CHAP-Challenge attribute to be present"
+                )
             challenge = self["CHAP-Challenge"][0]
+        else:
+            challenge = self.authenticator
+            if "CHAP-Challenge" in self:
+                challenge = self["CHAP-Challenge"][0]
 
         return password == hashlib.md5(chapid + userpwd + challenge).digest()
 
@@ -885,6 +980,8 @@ class AcctPacket(Packet):
             self.secret,
             self.authenticator,
             dict=self.dict,
+            protocol_version=self.protocol_version,
+            token=self.token,
             **attributes,
         )
 
@@ -904,6 +1001,17 @@ class AcctPacket(Packet):
         Returns:
             bytes: Raw packet
         """
+
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, use token-based authenticator instead of MD5.
+            if self.token is not None:
+                self.authenticator = self.token + 12 * b"\x00"
+            elif self.authenticator is None:
+                self.authenticator = 16 * b"\x00"
+
+            attr = self._PktEncodeAttributes()
+            header = struct.pack("!BBH", self.code, self.id, (20 + len(attr)))
+            return header + self.authenticator + attr
 
         if self.id is None:
             self.id = self.CreateID()
@@ -957,6 +1065,8 @@ class CoAPacket(Packet):
             self.secret,
             self.authenticator,
             dict=self.dict,
+            protocol_version=self.protocol_version,
+            token=self.token,
             **attributes,
         )
 
@@ -976,6 +1086,17 @@ class CoAPacket(Packet):
         :return: raw packet
         :rtype:  string
         """
+
+        if self.protocol_version == "1.1":
+            # In RADIUS/1.1 mode, use token-based authenticator instead of MD5.
+            if self.token is not None:
+                self.authenticator = self.token + 12 * b"\x00"
+            elif self.authenticator is None:
+                self.authenticator = 16 * b"\x00"
+
+            attr = self._PktEncodeAttributes()
+            header = struct.pack("!BBH", self.code, self.id, (20 + len(attr)))
+            return header + self.authenticator + attr
 
         attr = self._PktEncodeAttributes()
 
@@ -1009,7 +1130,12 @@ def CreateID() -> int:
     return CurrentID
 
 
-def parse_packet(data: bytes, secret: bytes, dictionary: Optional[Dictionary]):
+def parse_packet(
+    data: bytes,
+    secret: bytes,
+    dictionary: Optional[Dictionary],
+    protocol_version: Optional[str] = None,
+):
     code = data[0]
     packet_class: type[Packet]
 
@@ -1022,4 +1148,9 @@ def parse_packet(data: bytes, secret: bytes, dictionary: Optional[Dictionary]):
     else:
         packet_class = Packet
 
-    return packet_class(packet=data, dict=dictionary, secret=secret)
+    return packet_class(
+        packet=data,
+        dict=dictionary,
+        secret=secret,
+        protocol_version=protocol_version,
+    )

@@ -139,6 +139,7 @@ ATTRIBUTE	Framed-IPv6-Prefix	97	ipv6prefix	# stupid format
 ATTRIBUTE	Login-IPv6-Host		98	octets	# really IPv6
 ATTRIBUTE	Framed-IPv6-Route	99	string
 ATTRIBUTE	Framed-IPv6-Pool	100	string
+ATTRIBUTE	Error-Cause		101	integer
 ATTRIBUTE   Delegated-IPv6-Prefix   123     ipv6prefix
 
 

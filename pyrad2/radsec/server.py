@@ -5,7 +5,11 @@ from typing import Optional
 
 from loguru import logger
 
-from pyrad2.constants import PacketType
+from pyrad2.constants import (
+    PacketType,
+    RADIUS_ALPN_RADIUS_10,
+    RADIUS_ALPN_RADIUS_11,
+)
 from pyrad2.dictionary import Dictionary
 from pyrad2.packet import (
     AcctPacket,
@@ -43,7 +47,7 @@ class RadSecServer(ABC):
     dynamic authorization changes.
     """
 
-    ALLOWED_CIPHERS = "DES-CBC3-SHA:RC4-SHA:AES128-SHA"
+    ALLOWED_CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20"
 
     def __init__(
         self,
@@ -56,6 +60,7 @@ class RadSecServer(ABC):
         keyfile: str = "certs/server/server.key.pem",
         ca_certfile: str = "certs/ca/ca.cert.pem",
         verify_mode: ssl.VerifyMode = ssl.CERT_NONE,
+        radius_version: Optional[str] = None,
     ):
         """Initializes a RadSec server.
 
@@ -68,7 +73,18 @@ class RadSecServer(ABC):
             certfile (str): Path to server SSL certificate
             keyfile (str): Path to server SSL key
             ca_certfile (str): Path to server CA certificate
+            radius_version (str): RADIUS protocol version for ALPN negotiation (RFC 9765).
+                Valid values: None (legacy), "1.0", "1.1", "1.0,1.1".
         """
+        self.radius_version = radius_version
+
+        # Security guard: RADIUS/1.1 requires certificate verification
+        if radius_version is not None and "1.1" in radius_version and verify_mode == ssl.CERT_NONE:
+            raise ValueError(
+                "RADIUS/1.1 requires certificate verification "
+                "(ssl.CERT_NONE is not allowed)"
+            )
+
         self.listen_address = listen_address
         self.listen_port = listen_port
         self.hosts = {} if hosts is None else hosts
@@ -101,6 +117,23 @@ class RadSecServer(ABC):
             await server.wait_closed()
             logger.info("Server shutdown")
 
+    @staticmethod
+    def _build_alpn_list(radius_version: str) -> list[str]:
+        """Build the ALPN protocol list from the radius_version string.
+
+        Args:
+            radius_version: Version string ("1.0", "1.1", or "1.0,1.1")
+
+        Returns:
+            List of ALPN protocol identifiers
+        """
+        alpn_map = {
+            "1.0": [RADIUS_ALPN_RADIUS_10],
+            "1.1": [RADIUS_ALPN_RADIUS_11],
+            "1.0,1.1": [RADIUS_ALPN_RADIUS_10, RADIUS_ALPN_RADIUS_11],
+        }
+        return alpn_map[radius_version]
+
     def setup_ssl(self, certfile: str, keyfile: str, ca_certfile: str, verify_mode):
         ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         try:
@@ -114,6 +147,15 @@ class RadSecServer(ABC):
         ssl_ctx.verify_mode = verify_mode
         ssl_ctx.load_verify_locations(cafile=ca_certfile)
         ssl_ctx.set_ciphers(self.ALLOWED_CIPHERS)
+
+        # RFC 9765: ALPN negotiation for RADIUS/TLS
+        if self.radius_version is not None:
+            alpn_list = self._build_alpn_list(self.radius_version)
+            ssl_ctx.set_alpn_protocols(alpn_list)
+
+            # RADIUS/1.1 requires TLS 1.3
+            if "1.1" in self.radius_version:
+                ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
 
         self.ssl_ctx = ssl_ctx
 
@@ -136,21 +178,51 @@ class RadSecServer(ABC):
 
         logger.info("RADSEC connection established from {}", peername)
 
+        # RFC 9765: Determine negotiated ALPN protocol
+        ssl_object = writer.get_extra_info("ssl_object")
+        negotiated = ssl_object.selected_alpn_protocol() if ssl_object else None
+
+        if negotiated == RADIUS_ALPN_RADIUS_11:
+            protocol_version = "1.1"
+        else:
+            protocol_version = None
+
+        # If RADIUS/1.1 was required but not negotiated, reject the connection
+        if self.radius_version == "1.1" and negotiated != RADIUS_ALPN_RADIUS_11:
+            logger.warning(
+                "RADIUS/1.1 required but ALPN negotiated '{}' from {}, closing connection",
+                negotiated,
+                peername,
+            )
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        if negotiated:
+            logger.info("ALPN negotiated protocol: {} from {}", negotiated, peername)
+
         data = await read_radius_packet(reader)
         logger.info("Received {} bytes from {}", len(data), peername)
         logger.debug("Data (hex): {}", data.hex())
 
         try:
-            reply = await self.packet_received(data, host=peername[0])
+            reply = await self.packet_received(
+                data, host=peername[0], protocol_version=protocol_version
+            )
         except UnknownHost:
             logger.warning("Drop package from unknown source {}", peername[0])
             return
+
+        # Set protocol version on reply for proper encoding
+        reply.protocol_version = protocol_version
 
         writer.write(reply.ReplyPacket())
         await writer.drain()
         logger.info("Sent reply to {}: {}", peername, reply.code)
 
-    async def packet_received(self, data: bytes, host: str) -> Packet:
+    async def packet_received(
+        self, data: bytes, host: str, protocol_version: Optional[str] = None
+    ) -> Packet:
         if host in self.hosts:
             remote_host = self.hosts[host]
         elif "0.0.0.0" in self.hosts:
@@ -158,10 +230,18 @@ class RadSecServer(ABC):
         else:
             raise UnknownHost
 
-        packet = parse_packet(data, remote_host.secret, self.dict)
+        packet = parse_packet(data, remote_host.secret, self.dict, protocol_version)
 
         if self.verify_packet:
-            if not packet.verify():
+            if packet.code == PacketType.AccessRequest:
+                verified = packet.VerifyAuthRequest()
+            elif packet.code == PacketType.AccountingRequest:
+                verified = packet.VerifyAcctRequest()
+            elif packet.code in (PacketType.CoARequest, PacketType.DisconnectRequest):
+                verified = packet.VerifyCoARequest()
+            else:
+                verified = packet.VerifyPacket()
+            if not verified:
                 raise PacketError("Packet verification failed")
 
         if packet.code == PacketType.AccessRequest:

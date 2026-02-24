@@ -1,4 +1,5 @@
 import asyncio
+import os
 import ssl
 import struct
 from hashlib import md5
@@ -6,7 +7,13 @@ from typing import Optional
 
 from loguru import logger
 
-from pyrad2.constants import EAPPacketType, EAPType, PacketType
+from pyrad2.constants import (
+    EAPPacketType,
+    EAPType,
+    PacketType,
+    RADIUS_ALPN_RADIUS_10,
+    RADIUS_ALPN_RADIUS_11,
+)
 from pyrad2.packet import (
     AcctPacket,
     AuthPacket,
@@ -32,6 +39,7 @@ class RadSecClient:
         keyfile: str = "certs/client/client.key.pem",
         certfile_server: str = "certs/ca/ca.cert.pem",
         check_hostname: bool = False,
+        radius_version: Optional[str] = None,
     ):
         """Initializes a RadSec client.
 
@@ -46,6 +54,8 @@ class RadSecClient:
             certfile (str): Path to client SSL certificate
             keyfile (str): Path to client SSL key
             certfile_server (str): Path to server SSL certificate
+            radius_version (str): RADIUS protocol version for ALPN negotiation (RFC 9765).
+                Valid values: None (legacy), "1.0", "1.1", "1.0,1.1".
 
         """
         self.server = server
@@ -54,6 +64,7 @@ class RadSecClient:
         self.retries = retries
         self.timeout = timeout
         self.dict = dict
+        self.radius_version = radius_version
 
         self.setup_ssl(certfile, keyfile, certfile_server, check_hostname)
 
@@ -73,6 +84,41 @@ class RadSecClient:
             raise FileNotFoundError(msg.format(ssl_paths)) from e
 
         self.ssl_ctx.check_hostname = check_hostname
+
+        # RFC 9765: ALPN negotiation for RADIUS/TLS
+        if self.radius_version is not None:
+            alpn_list = self._build_alpn_list(self.radius_version)
+            self.ssl_ctx.set_alpn_protocols(alpn_list)
+
+            # RADIUS/1.1 requires TLS 1.3
+            if "1.1" in self.radius_version:
+                self.ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+
+    @staticmethod
+    def _build_alpn_list(radius_version: str) -> list[str]:
+        """Build the ALPN protocol list from the radius_version string.
+
+        Args:
+            radius_version: Version string ("1.0", "1.1", or "1.0,1.1")
+
+        Returns:
+            List of ALPN protocol identifiers
+        """
+        alpn_map = {
+            "1.0": [RADIUS_ALPN_RADIUS_10],
+            "1.1": [RADIUS_ALPN_RADIUS_11],
+            "1.0,1.1": [RADIUS_ALPN_RADIUS_10, RADIUS_ALPN_RADIUS_11],
+        }
+        return alpn_map[radius_version]
+
+    @staticmethod
+    def _create_token() -> bytes:
+        """Generate a random 4-byte token for RADIUS/1.1 packets.
+
+        Returns:
+            bytes: 4 random bytes to use as a packet token
+        """
+        return os.urandom(4)
 
     def create_auth_packet(self, **kwargs) -> AuthPacket:
         """Create a new RADIUS packet.
@@ -141,6 +187,34 @@ class RadSecClient:
             self.server,
             self.port,
         )
+
+        # RFC 9765: Determine negotiated ALPN protocol
+        ssl_object = writer.get_extra_info("ssl_object")
+        negotiated = ssl_object.selected_alpn_protocol() if ssl_object else None
+
+        if negotiated == RADIUS_ALPN_RADIUS_11:
+            protocol_version = "1.1"
+        else:
+            protocol_version = None
+
+        # If RADIUS/1.1 was required but not negotiated, fail
+        if self.radius_version == "1.1" and negotiated != RADIUS_ALPN_RADIUS_11:
+            writer.close()
+            await writer.wait_closed()
+            raise PacketError(
+                "RADIUS/1.1 ALPN negotiation failed: server negotiated '{}'"
+                .format(negotiated)
+            )
+
+        if negotiated:
+            logger.info("ALPN negotiated protocol: {}", negotiated)
+
+        # Set protocol version on the packet
+        packet.protocol_version = protocol_version
+
+        # In RADIUS/1.1 mode, assign a random token to the packet
+        if protocol_version == "1.1":
+            packet.token = self._create_token()
 
         writer.write(packet.RequestPacket())
         await writer.drain()
